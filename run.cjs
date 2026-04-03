@@ -53,15 +53,19 @@ function log(msg) {
   console.log(`[${ts}] ${msg}`);
 }
 
-function exec(cmd, opts = {}) {
-  const result = spawnSync('bash', ['-c', cmd], {
+function execArgs(bin, args, opts = {}) {
+  const result = spawnSync(bin, args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     ...opts,
   });
+  if (result.error) {
+    if (opts.allowFailure) return '';
+    throw new Error(`Command failed to start: ${bin} ${args.join(' ')}\n${result.error.message}`);
+  }
   if (result.status !== 0 && !opts.allowFailure) {
     const msg = (result.stderr || '').trim() || `exit ${result.status}`;
-    throw new Error(`Command failed: ${cmd}\n${msg}`);
+    throw new Error(`Command failed: ${bin} ${args.join(' ')}\n${msg}`);
   }
   return (result.stdout || '').trim();
 }
@@ -204,7 +208,7 @@ async function downloadIssueImages(issue, stamp) {
 
   const issueDir = `${ISSUE_IMAGE_ROOT}/${stamp}/issue-${issue.number}`;
   mkdirSync(issueDir, { recursive: true });
-  const githubToken = exec('gh auth token', { allowFailure: true });
+  const githubToken = execArgs('gh', ['auth', 'token'], { allowFailure: true });
 
   const images = [];
   for (let index = 0; index < urls.length; index += 1) {
@@ -367,7 +371,7 @@ async function ntfyPost(body, title, priority = 'default') {
 
 function getPRFeedback(prUrl, repo) {
   try {
-    const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${repo} --json reviews,comments`));
+    const data = JSON.parse(execArgs('gh', ['pr', 'view', prUrl, '--repo', repo, '--json', 'reviews,comments']));
     const feedback = [];
     for (const c of (data.comments || [])) {
       if (c.author.login === GIT_NAME) feedback.push(`Comment from ${GIT_NAME}: ${c.body}`);
@@ -387,10 +391,9 @@ function getPRFeedback(prUrl, repo) {
 
 async function waitForApproval(prUrl, repo, since) {
   log(`Waiting for ${GIT_NAME} to review/approve PR: ${prUrl} (ignoring feedback before ${since.toISOString()})`);
-  
   while (true) {
     try {
-      const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${repo} --json reviews,comments,state`));
+      const data = JSON.parse(execArgs('gh', ['pr', 'view', prUrl, '--repo', repo, '--json', 'reviews,comments,state']));
       
       const approval = (data.reviews || []).find(r => 
         r.author.login === GIT_NAME && 
@@ -402,13 +405,13 @@ async function waitForApproval(prUrl, repo, since) {
       const changesRequested = (data.reviews || []).find(r => 
         r.author.login === GIT_NAME && 
         r.state === 'CHANGES_REQUESTED' &&
-        new Date(r.submittedAt || 0) > since
+        new Date(r.submittedAt || r.createdAt || 0) > since
       );
       if (changesRequested) return 'iterate';
       
       const allComments = [
         ...(data.comments || []),
-        ...(data.reviews || []).map(r => ({ body: r.body, author: r.author, createdAt: r.submittedAt })),
+        ...(data.reviews || []).map(r => ({ body: r.body, author: r.author, createdAt: r.submittedAt || r.createdAt })),
         ...(data.reviews || []).flatMap(r => (r.comments || []).map(lc => ({ ...lc, createdAt: lc.createdAt })))
       ];
       
@@ -427,7 +430,6 @@ async function waitForApproval(prUrl, repo, since) {
     } catch (e) {
       log(`Error polling PR: ${e.message}`);
     }
-    
     await new Promise(r => setTimeout(r, 30000)); 
   }
 }
@@ -446,7 +448,7 @@ async function run() {
   if (existsSync(LOCKFILE)) {
     const pid = readFileSync(LOCKFILE, 'utf8').trim();
     try {
-      exec(`kill -0 ${pid}`);
+      execArgs('kill', ['-0', pid]);
       log(`Another instance (PID ${pid}) is running. Exiting.`);
       process.exit(0);
     } catch {
@@ -470,7 +472,7 @@ async function run() {
 }
 
 async function pipeline(repo) {
-  const openPRs = JSON.parse(exec(`gh pr list --repo ${repo} --state open --json number,headRefName,body`));
+  const openPRs = JSON.parse(execArgs('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--json', 'number,headRefName,body']));
   const botPRs = openPRs.filter(pr => pr.headRefName.startsWith('bot/'));
   
   let branch;
@@ -489,13 +491,13 @@ async function pipeline(repo) {
   let issues = [];
   if (manualIssueNumbers.length > 0) {
     for (const num of manualIssueNumbers) {
-      try { issues.push(JSON.parse(exec(`gh issue view ${num} --repo ${repo} --json number,title,body,labels,comments`))); } catch (e) { log(`Failed to fetch resumed issue #${num}: ${e.message}`); }
+      try { issues.push(JSON.parse(execArgs('gh', ['issue', 'view', num, '--repo', repo, '--json', 'number,title,body,labels,comments']))); } catch (e) { log(`Failed to fetch resumed issue #${num}: ${e.message}`); }
     }
   }
 
   if (issues.length === 0) {
-    const issueStubs = JSON.parse(exec(`gh issue list --repo ${repo} --state open --label auto --json number,title --limit 20`));
-    issues = issueStubs.map(issue => JSON.parse(exec(`gh issue view ${issue.number} --repo ${repo} --json number,title,body,labels,comments`)));
+    const issueStubs = JSON.parse(execArgs('gh', ['issue', 'list', '--repo', repo, '--state', 'open', '--label', 'auto', '--json', 'number,title', '--limit', '20']));
+    issues = issueStubs.map(issue => JSON.parse(execArgs('gh', ['issue', 'view', String(issue.number), '--repo', repo, '--json', 'number,title,body,labels,comments'])));
   }
 
   if (issues.length === 0) {
@@ -529,33 +531,33 @@ async function pipeline(repo) {
   const workspace = join(BOT_REPO_BASE, repo.replace('/', '-'));
   if (!existsSync(workspace)) {
     mkdirSync(workspace, { recursive: true });
-    exec(`gh repo clone ${repo} ${workspace}`);
+    execArgs('gh', ['repo', 'clone', repo, workspace]);
   }
 
-  exec(`git -C ${workspace} fetch origin`);
+  execArgs('git', ['-C', workspace, 'fetch', 'origin']);
   
   // Ensure correct identity in workspace
-  exec(`git -C ${workspace} config user.name "${GIT_NAME}"`);
-  exec(`git -C ${workspace} config user.email "${GIT_EMAIL}"`);
+  execArgs('git', ['-C', workspace, 'config', 'user.name', GIT_NAME]);
+  execArgs('git', ['-C', workspace, 'config', 'user.email', GIT_EMAIL]);
   
   if (resumePR) {
-    exec(`git -C ${workspace} checkout ${branch}`);
-    exec(`git -C ${workspace} reset --hard origin/${branch}`);
+    execArgs('git', ['-C', workspace, 'checkout', branch]);
+    execArgs('git', ['-C', workspace, 'reset', '--hard', `origin/${branch}`]);
   } else {
-    exec(`git -C ${workspace} checkout main`);
-    exec(`git -C ${workspace} reset --hard origin/main`);
-    exec(`git -C ${workspace} clean -fd`);
+    execArgs('git', ['-C', workspace, 'checkout', 'main']);
+    execArgs('git', ['-C', workspace, 'reset', '--hard', 'origin/main']);
+    execArgs('git', ['-C', workspace, 'clean', '-fd']);
   }
   
   if (existsSync(join(workspace, 'package.json'))) {
     log(`[${repo}] Installing dependencies...`);
-    exec(`pnpm -C ${workspace} install --no-frozen-lockfile`, { allowFailure: true });
+    execArgs('pnpm', ['-C', workspace, 'install', '--no-frozen-lockfile'], { allowFailure: true });
   }
 
   if (!resumePR) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     branch = `bot/issues-${stamp}`;
-    exec(`git -C ${workspace} checkout -b ${branch}`);
+    execArgs('git', ['-C', workspace, 'checkout', '-b', branch]);
   }
 
   const stampForImages = branch.replace('bot/issues-', '');
@@ -601,21 +603,21 @@ async function pipeline(repo) {
     cycleCount += 1;
 
     let prUrl;
-    try { prUrl = exec(`gh pr view ${branch} --repo ${repo} --json url -q .url`, { allowFailure: true }); } catch {}
+    try { prUrl = execArgs('gh', ['pr', 'view', branch, '--repo', repo, '--json', 'url', '-q', '.url'], { allowFailure: true }); } catch {}
 
     const userFeedback = prUrl ? getPRFeedback(prUrl, repo) : null;
     const feedbackCtx = userFeedback ? `\n\n## Human Review Feedback (HIGH PRIORITY)\n${userFeedback}` : '';
 
     // ── Stage 2: Verify & Fix
-    const fullDiff      = exec(`git -C ${workspace} diff origin/main`, { allowFailure: true });
-    const untracked     = exec(`git -C ${workspace} ls-files --others --exclude-standard`, { allowFailure: true });
+    const fullDiff      = execArgs('git', ['-C', workspace, 'diff', 'origin/main'], { allowFailure: true });
+    const untracked     = execArgs('git', ['-C', workspace, 'ls-files', '--others', '--exclude-standard'], { allowFailure: true });
     const diffSection   = fullDiff  ? `\`\`\`diff\n${fullDiff}\n\`\`\`` : '(no changes)';
     const newFiles      = untracked ? `\n## New Files\n${untracked}` : '';
 
     const verifyPrompt = `${codebaseCtx}\nReview the current changes and fix any remaining issues, bugs, or type errors.${feedbackCtx}\n\n## Issues\n${issueText}\n\n## Changes to Review\n${diffSection}${newFiles}\n\nInstructions:\n- Read code carefully to match existing patterns.\n- If you modified package.json or collections, run \`pnpm install\` and \`pnpm generate:types\`.\n- BEFORE COMMITTING: you MUST run existing lint/typecheck scripts.\n- If you made changes, stage all and commit referencing ${issueRefs}.\n- If no more changes are needed, explicitly state that you are done.`;
     await runGemini(`${repo}:verify:c${cycleCount}`, [...issueImageArgs, '-p', verifyPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], workspace, { onAllExhausted: exhaustedHandler });
 
-    const commits = exec(`git -C ${workspace} log origin/main..HEAD --format="• %s"`, { allowFailure: true });
+    const commits = execArgs('git', ['-C', workspace, 'log', 'origin/main..HEAD', '--format=• %s'], { allowFailure: true });
     
     if (!commits) {
       log(`[${repo}] No changes made in cycle ${cycleCount}.`);
@@ -630,31 +632,47 @@ async function pipeline(repo) {
       if (noProgressState[repo] === issueRefs) { delete noProgressState[repo]; writeFileSync(NO_PROGRESS_FILE, JSON.stringify(noProgressState)); }
     }
 
-    exec(`git -C ${workspace} push -f -u origin ${branch}`);
+    execArgs('git', ['-C', workspace, 'push', '-f', '-u', 'origin', branch]);
 
     if (!prUrl) {
-      const titlePrompt = `Write a PR title summarizing these changes: ${issueRefs}`;
+      const titlePrompt = `Write a concise PR title summarizing these changes: ${issueRefs}. Return ONLY the title string, without any preamble, explanation, or quotes.`;
       const prTitleRaw = await runGemini(`${repo}:title`, ['-p', titlePrompt, '-y', '--output-format', 'text'], workspace);
-      const prTitle = prTitleRaw.split('\n')[0].trim().slice(0, 72);
+      
+      const titleLines = prTitleRaw.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+      const preambleWithColon = /^(?:sure|here|proposed|below|this|i|my|the|an?|title|summary|ok|okay|pr|as requested).*?[:]+\s*/i;
+      const chattySentence = /^(?:i have|i've|sure|here|this is|please|below).*?$/i;
+      const noiseOnly = /^(?:sure|here|below|ok|okay|hi|hello|yes|i have (?:applied|updated).*|thanks|thank you|as requested)[!.]?$/i;
+
+      let candidates = titleLines
+        .map(l => l.replace(preambleWithColon, '').replace(/^[*_"`' \t]+|[*_"`' \t]+$/g, '').trim())
+        .filter(l => l.length > 0 && !noiseOnly.test(l) && !chattySentence.test(l));
+
+      let prTitle = candidates[0] || 'Update';
+      if (prTitle.length < 4) {
+        const nextBest = candidates.find(l => l.length > 4);
+        if (nextBest) prTitle = nextBest;
+      }
+      if (!prTitle || prTitle.length < 4) prTitle = 'Update';
+      prTitle = prTitle.slice(0, 72);
+
       const resolvesList = issues.map(i => `Resolves #${i.number}`).join('\n');
       const prBodyFile = `/tmp/forest-pr-body-${Date.now()}.txt`;
       writeFileSync(prBodyFile, `${resolvesList}\n\n${issueList}`);
-      try { prUrl = exec(`gh pr create --repo ${repo} --title ${JSON.stringify(prTitle)} --body-file ${prBodyFile} --head ${branch} --base main`); } finally { try { unlinkSync(prBodyFile); } catch {} }
+      try { prUrl = execArgs('gh', ['pr', 'create', '--repo', repo, '--title', prTitle, '--body-file', prBodyFile, '--head', branch, '--base', 'main']); } finally { try { unlinkSync(prBodyFile); } catch {} }
     }
 
     const proposal = [`[${repo}] Issue resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', `Review on GitHub:`, '• APPROVE to merge', '• REQUEST CHANGES to fix', '• Comment "/stop" to quit'].join('\n');
-    
     const since = new Date();
     await ntfyPost(proposal, `forest — Approval (${repo})`, 'high');
 
     const decision = await waitForApproval(prUrl, repo, since);
     if (decision === 'merge') {
-      exec(`gh pr merge ${prUrl} --squash --delete-branch --admin --repo ${repo}`);
-      for (const issue of issues) exec(`gh issue close ${issue.number} --repo ${repo} --comment "Resolved by ${prUrl}"`, { allowFailure: true });
+      execArgs('gh', ['pr', 'merge', prUrl, '--squash', '--delete-branch', '--admin', '--repo', repo]);
+      for (const issue of issues) execArgs('gh', ['issue', 'close', String(issue.number), '--repo', repo, '--comment', `Resolved by ${prUrl}`], { allowFailure: true });
       await ntfyPost(`[${repo}] Merged!`, `forest — Deployed (${repo})`, 'high');
       break;
     } else if (decision === 'iterate') continue;
-    else if (decision === 'stop') { exec('systemctl --user stop forest.timer'); process.exit(0); }
+    else if (decision === 'stop') { execArgs('systemctl', ['--user', 'stop', 'forest.timer']); process.exit(0); }
     else break;
   }
   try { if (existsSync(`${ISSUE_IMAGE_ROOT}/${stampForImages}`)) rmSync(`${ISSUE_IMAGE_ROOT}/${stampForImages}`, { recursive: true, force: true }); } catch {}
