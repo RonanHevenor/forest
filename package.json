@@ -1,0 +1,13 @@
+{
+  "name": "polybot",
+  "version": "1.0.0",
+  "description": "Automated issue resolution bot for The Polytechnic",
+  "main": "run.js",
+  "type": "module",
+  "scripts": {
+    "start": "node run.js"
+  },
+  "keywords": [],
+  "author": "Ronan Hevenor",
+  "license": "ISC"
+}
