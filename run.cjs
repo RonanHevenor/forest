@@ -69,6 +69,21 @@ function formatAgentFailure(label, result) {
   return `[${label}] exited ${result.status}${details ? ':\n' + details : ''}`;
 }
 
+function getForestVersion() {
+  try {
+    const commits = parseInt(exec(`git -C ${__dirname} rev-list --count HEAD`, { allowFailure: true }), 10);
+    if (isNaN(commits)) return '1.0.0';
+    const baseCommits = 8;
+    const n = Math.max(0, commits - baseCommits);
+    const major = 1 + Math.floor(n / 100);
+    const minor = Math.floor((n % 100) / 10);
+    const patch = n % 10;
+    return `${major}.${minor}.${patch}`;
+  } catch {
+    return '1.0.0';
+  }
+}
+
 function isGeminiLimitMessage(text) {
   const t = text.toLowerCase();
   return (
@@ -339,7 +354,7 @@ async function ntfyPost(body, title, priority = 'default') {
     try {
       const response = await fetch(NTFY_URL, {
         method: 'POST',
-        headers: { 'Title': headerSafeTitle, 'Priority': priority, 'Tags': 'robot', 'User-Agent': 'forest' },
+        headers: { 'Title': headerSafeTitle, 'Priority': priority, 'User-Agent': 'forest' },
         body,
         signal: AbortSignal.timeout(15000),
       });
@@ -467,10 +482,10 @@ async function pipeline(repo) {
       if (state[repo] === issueRefs) {
         log(`[${repo}] Already reported no progress for these issues. Skipping notification.`);
       } else {
-        await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
+        await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest ${getForestVersion()}`);
       }
     } else {
-      await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
+      await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest ${getForestVersion()}`);
     }
 
     if (existsSync(QUOTA_NOTIF_FILE)) {
@@ -534,7 +549,7 @@ async function pipeline(repo) {
     if (state[repo] === issueRefs) alreadyNotified = true;
     if (!alreadyNotified) {
       const msg = `[${repo}] Found new issues but all Gemini models are exhausted.\n\nIssues:\n${issueList}\n\nforest will automatically retry every 60 seconds.`;
-      await ntfyPost(msg, `forest — Quota Exhausted (${repo})`, 'default');
+      await ntfyPost(msg, `forest ${getForestVersion()} — Quota Exhausted (${repo})`, 'default');
       state[repo] = issueRefs;
       writeFileSync(QUOTA_NOTIF_FILE, JSON.stringify(state));
     }
@@ -598,13 +613,13 @@ async function pipeline(repo) {
     }
 
     const proposal = [`[${repo}] Issue resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', 'Review on GitHub:', '• APPROVE to merge', '• REQUEST CHANGES to fix', '• Comment "/stop" to quit'].join('\n');
-    await ntfyPost(proposal, `forest — Approval (${repo})`, 'high');
+    await ntfyPost(proposal, `forest ${getForestVersion()} — Approval (${repo})`, 'high');
 
     const decision = await waitForApproval(prUrl, repo);
     if (decision === 'merge') {
       exec(`gh pr merge ${prUrl} --squash --delete-branch --admin --repo ${repo}`);
       for (const issue of issues) exec(`gh issue close ${issue.number} --repo ${repo} --comment "Resolved by ${prUrl}"`, { allowFailure: true });
-      await ntfyPost(`[${repo}] Merged!`, `forest — Deployed (${repo})`, 'high');
+      await ntfyPost(`[${repo}] Merged!`, `forest ${getForestVersion()} — Deployed (${repo})`, 'high');
       break;
     } else if (decision === 'iterate') continue;
     else if (decision === 'stop') { exec('systemctl --user stop forest.timer'); process.exit(0); }
@@ -615,7 +630,7 @@ async function pipeline(repo) {
 
 run().catch(async err => {
   log(`Fatal: ${err.message}`);
-  try { await ntfyPost(err.message.slice(0, 500), 'forest - Crash', 'urgent'); } catch {}
+  try { await ntfyPost(err.message.slice(0, 500), `forest ${getForestVersion()} — Crash`, 'urgent'); } catch {}
   try { unlinkSync(LOCKFILE); } catch {}
   process.exit(1);
 });
