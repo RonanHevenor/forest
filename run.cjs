@@ -2,14 +2,23 @@
 'use strict';
 
 /**
- * Polymer Bot
+ * forest
  * Automated issue resolution pipeline for thepoly/polymer.
+ * 
+ * Flow:
+ * 1. Plan (Gemini)
+ * 2. Implement (Gemini Autonomous)
+ * 3. Review (Gemini - Iterative)
+ * 4. Fix & Commit (Gemini Autonomous - Iterative)
+ * 5. PR & User Approval
  */
 
 const { spawnSync }                                   = require('child_process');
 const { existsSync, mkdirSync, writeFileSync,
         readFileSync, unlinkSync, rmSync }             = require('fs');
 const { join }                                        = require('path');
+
+// __dirname is global in CJS
 
 // ─── Env Loader ───────────────────────────────────────────────────────────────
 
@@ -29,13 +38,13 @@ if (existsSync(envPath)) {
 const NTFY_TOPIC = process.env.NTFY_TOPIC || 'designer-slick-fetch-lily-spherical-gout-chitchat-snorkel';
 const NTFY_URL   = `https://ntfy.sh/${NTFY_TOPIC}`;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'thepoly/polymer';
-const BOT_REPO    = process.env.BOT_REPO || '/home/poly/polymer-bot';
+const BOT_REPO    = process.env.BOT_REPO || '/home/poly/forest';
 const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-pro-preview,gemini-2.5-pro,gemini-3-flash-preview').split(',');
 
-const LOCKFILE     = '/tmp/polymer-bot.lock';
+const LOCKFILE     = '/tmp/forest.lock';
 const APPROVAL_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24h
 const MAX_CYCLES   = 5;
-const ISSUE_IMAGE_ROOT = '/tmp/polymer-bot-issue-images';
+const ISSUE_IMAGE_ROOT = '/tmp/forest-issue-images';
 const MAX_ISSUE_IMAGES = 6;
 const AGENT_MAX_BUFFER = 100 * 1024 * 1024;
 
@@ -207,7 +216,7 @@ async function downloadIssueImages(issue, stamp) {
         headers: {
           ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
           Accept: 'application/octet-stream',
-          'User-Agent': 'polymer-bot',
+          'User-Agent': 'forest',
         },
       });
       if (!response.ok) continue;
@@ -332,7 +341,7 @@ async function ntfyPost(body, title, priority = 'default') {
     try {
       const response = await fetch(NTFY_URL, {
         method: 'POST',
-        headers: { 'Title': headerSafeTitle, 'Priority': priority, 'Tags': 'robot', 'User-Agent': 'polymer-bot' },
+        headers: { 'Title': headerSafeTitle, 'Priority': priority, 'Tags': 'robot', 'User-Agent': 'forest' },
         body,
         signal: AbortSignal.timeout(15000),
       });
@@ -436,9 +445,11 @@ async function pipeline() {
     branch = resumePR.headRefName;
     log(`Resuming existing bot PR #${resumePR.number} (${branch}).`);
     
-    const match = resumePR.body.match(/Automated PR resolving: (#[0-9, #]+)/);
-    if (match) {
-      manualIssueNumbers = match[1].split(/[, ]+/).map(s => s.replace('#', '').trim()).filter(Boolean);
+    // Extract issues from body: "Resolves #123" or "Automated PR resolving: #123"
+    const bodyText = resumePR.body || '';
+    const issueMatches = bodyText.match(/#[0-9]+/g);
+    if (issueMatches) {
+      manualIssueNumbers = Array.from(new Set(issueMatches.map(s => s.replace('#', ''))));
     }
   }
 
@@ -466,7 +477,7 @@ async function pipeline() {
 
   if (!existsSync(BOT_REPO)) {
     const msg = `Bot repo not found at ${BOT_REPO}.`;
-    await ntfyPost(msg, 'Polymer Bot — Setup Required', 'urgent');
+    await ntfyPost(msg, 'forest — Setup Required', 'urgent');
     process.exit(1);
   }
 
@@ -551,25 +562,37 @@ async function pipeline() {
       const titlePrompt = `Write a PR title for these changes.\n\nIssues:\n${issueRefs}\n\nCommits:\n${commits}`;
       const prTitleRaw = await runGemini('Gemini:title', ['-p', titlePrompt, '-y', '--output-format', 'text'], BOT_REPO);
       const prTitle = prTitleRaw.split('\n')[0].trim().slice(0, 72);
-      const prBodyFile = `/tmp/polymer-bot-pr-body-${Date.now()}.txt`;
-      writeFileSync(prBodyFile, `Automated PR resolving: ${issueRefs}\n\n## Gemini Review\n${evaluation}`);
-      try { prUrl = exec(`gh pr create --repo ${GITHUB_REPO} --title ${JSON.stringify(prTitle)} --body-file ${prBodyFile} --head ${branch} --base main`); } finally { try { unlinkSync(prBodyFile); } catch {} }
+      
+      const resolvesList = enrichedIssues.map(i => `Resolves #${i.number}`).join('\n');
+      const prBodyFile = `/tmp/forest-pr-body-${Date.now()}.txt`;
+      writeFileSync(prBodyFile, `${resolvesList}\n\n## Gemini Review\n${evaluation}`);
+      try {
+        prUrl = exec(`gh pr create --repo ${GITHUB_REPO} --title ${JSON.stringify(prTitle)} --body-file ${prBodyFile} --head ${branch} --base main`);
+      } finally {
+        try { unlinkSync(prBodyFile); } catch {}
+      }
     }
 
     const proposal = [`${enrichedIssues.length} issue(s) resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', 'Reply:', '• "merge" to deploy', '• "iterate" to review again', '• "stop" to shutdown timer'].join('\n');
     const since = Math.floor(Date.now() / 1000);
-    await ntfyPost(proposal, `Polymer Bot — Approval (C${cycleCount})`, 'high');
+    await ntfyPost(proposal, `forest — Approval (C${cycleCount})`, 'high');
 
     const decision = await waitForApproval(since);
     if (decision === 'merge') {
       exec(`gh pr merge ${prUrl} --squash --delete-branch --admin --repo ${GITHUB_REPO}`);
-      await ntfyPost(`Merged!`, 'Polymer Bot — Deployed', 'high');
+      
+      // Explicitly close issues as fallback
+      for (const issue of enrichedIssues) {
+        exec(`gh issue close ${issue.number} --repo ${GITHUB_REPO} --comment "Resolved by ${prUrl}"`, { allowFailure: true });
+      }
+      
+      await ntfyPost(`Merged!`, 'forest — Deployed', 'high');
       break;
     } else if (decision === 'iterate') {
       continue;
     } else if (decision === 'stop') {
-      exec('systemctl --user stop polymer-bot.timer');
-      await ntfyPost('Stopped.', 'Polymer Bot — Stopped');
+      exec('systemctl --user stop forest.timer');
+      await ntfyPost('Stopped.', 'forest — Stopped');
       break;
     } else {
       break;
@@ -579,11 +602,9 @@ async function pipeline() {
   try { if (existsSync(`${ISSUE_IMAGE_ROOT}/${stampForImages}`)) rmSync(`${ISSUE_IMAGE_ROOT}/${stampForImages}`, { recursive: true, force: true }); } catch {}
 }
 
-const __dirname = new URL('.', import.meta.url).pathname;
-mkdirSync('/home/poly/.gemini', { recursive: true });
 run().catch(async err => {
   log(`Fatal: ${err.message}`);
-  try { await ntfyPost(err.message.slice(0, 500), 'Polymer Bot - Crash', 'urgent'); } catch {}
+  try { await ntfyPost(err.message.slice(0, 500), 'forest - Crash', 'urgent'); } catch {}
   try { unlinkSync(LOCKFILE); } catch {}
   process.exit(1);
 });

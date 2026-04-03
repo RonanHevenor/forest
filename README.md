@@ -1,10 +1,10 @@
-# Polybot
+# forest
 
 Automated issue resolution pipeline for The Polytechnic student newspaper.
 
 ## Overview
 
-Polybot automatically fetches open GitHub issues with the `auto` label, generates an implementation plan, applies code changes, reviews them for quality, and opens a Pull Request for human approval.
+forest automatically fetches open GitHub issues with the `auto` label, generates an implementation plan, applies code changes, reviews them for quality, and opens a Pull Request for human approval.
 
 ## Agent Pipeline
 
@@ -26,5 +26,5 @@ The bot is currently managed by a systemd timer on the production server.
 
 ```bash
 # View logs
-journalctl --user -u polymer-bot.service -f
+journalctl --user -u forest.service -f
 ```
