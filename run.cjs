@@ -389,25 +389,47 @@ function getPRFeedback(prUrl, repo) {
   }
 }
 
-async function waitForApproval(prUrl, repo) {
-  log(`Waiting for ${GIT_NAME} to review/approve PR: ${prUrl}`);
+async function waitForApproval(prUrl, repo, since) {
+  log(`Waiting for ${GIT_NAME} to review/approve PR: ${prUrl} (ignoring feedback before ${since.toISOString()})`);
   while (true) {
     try {
       const data = JSON.parse(execArgs('gh', ['pr', 'view', prUrl, '--repo', repo, '--json', 'reviews,comments,state']));
-      const approval = (data.reviews || []).find(r => r.author.login === GIT_NAME && r.state === 'APPROVED');
+      
+      const approval = (data.reviews || []).find(r => 
+        r.author.login === GIT_NAME && 
+        r.state === 'APPROVED' &&
+        new Date(r.submittedAt || r.createdAt || 0) > since
+      );
       if (approval) return 'merge';
-      const changesRequested = (data.reviews || []).find(r => r.author.login === GIT_NAME && r.state === 'CHANGES_REQUESTED');
+      
+      const changesRequested = (data.reviews || []).find(r => 
+        r.author.login === GIT_NAME && 
+        r.state === 'CHANGES_REQUESTED' &&
+        new Date(r.submittedAt || r.createdAt || 0) > since
+      );
       if (changesRequested) return 'iterate';
-      const allComments = [...(data.comments || []), ...(data.reviews || []).map(r => ({ body: r.body, author: r.author })), ...(data.reviews || []).flatMap(r => r.comments || [])];
+      
+      const allComments = [
+        ...(data.comments || []),
+        ...(data.reviews || []).map(r => ({ body: r.body, author: r.author, createdAt: r.submittedAt || r.createdAt })),
+        ...(data.reviews || []).flatMap(r => (r.comments || []).map(lc => ({ ...lc, createdAt: lc.createdAt })))
+      ];
+      
       for (const c of allComments) {
         if (!c || !c.author || c.author.login !== GIT_NAME) continue;
+        if (new Date(c.createdAt || 0) <= since) continue;
+
         const msg = (c.body || '').trim().toLowerCase();
         if (msg.includes('/merge')) return 'merge';
         if (msg.includes('/iterate')) return 'iterate';
         if (msg.includes('/stop')) return 'stop';
       }
+      
       if (data.state === 'MERGED' || data.state === 'CLOSED') return 'stop';
-    } catch (e) { log(`Error polling PR: ${e.message}`); }
+
+    } catch (e) {
+      log(`Error polling PR: ${e.message}`);
+    }
     await new Promise(r => setTimeout(r, 30000)); 
   }
 }
@@ -610,11 +632,12 @@ async function pipeline(repo) {
       
       const titleLines = prTitleRaw.split('\n').map(l => l.trim()).filter(l => l.length > 0);
       const preambleWithColon = /^(?:sure|here|proposed|below|this|i|my|the|an?|title|summary|ok|okay|pr|as requested).*?[:]+\s*/i;
+      const chattySentence = /^(?:i have|i've|sure|here|this is|please|below).*?$/i;
       const noiseOnly = /^(?:sure|here|below|ok|okay|hi|hello|yes|i have (?:applied|updated).*|thanks|thank you|as requested)[!.]?$/i;
 
       let candidates = titleLines
         .map(l => l.replace(preambleWithColon, '').replace(/^[*_"`' \t]+|[*_"`' \t]+$/g, '').trim())
-        .filter(l => l.length > 0 && !noiseOnly.test(l));
+        .filter(l => l.length > 0 && !noiseOnly.test(l) && !chattySentence.test(l));
 
       let prTitle = candidates[0] || 'Update';
       if (prTitle.length < 4) {
@@ -631,9 +654,10 @@ async function pipeline(repo) {
     }
 
     const proposal = [`[${repo}] Issue resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', `Review on GitHub:`, '• APPROVE to merge', '• REQUEST CHANGES to fix', '• Comment "/stop" to quit'].join('\n');
+    const since = new Date();
     await ntfyPost(proposal, `forest — Approval (${repo})`, 'high');
 
-    const decision = await waitForApproval(prUrl, repo);
+    const decision = await waitForApproval(prUrl, repo, since);
     if (decision === 'merge') {
       execArgs('gh', ['pr', 'merge', prUrl, '--squash', '--delete-branch', '--admin', '--repo', repo]);
       for (const issue of issues) execArgs('gh', ['issue', 'close', String(issue.number), '--repo', repo, '--comment', `Resolved by ${prUrl}`], { allowFailure: true });
