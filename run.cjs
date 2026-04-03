@@ -504,6 +504,10 @@ async function pipeline(repo) {
 
   exec(`git -C ${workspace} fetch origin`);
   
+  // Ensure correct identity in workspace
+  exec(`git -C ${workspace} config user.name "RonanHevenor"`);
+  exec(`git -C ${workspace} config user.email "spacechickenrobot@gmail.com"`);
+  
   if (resumePR) {
     exec(`git -C ${workspace} checkout ${branch}`);
     exec(`git -C ${workspace} reset --hard origin/${branch}`);
@@ -537,7 +541,7 @@ async function pipeline(repo) {
   const codebaseCtx = [
     `Codebase: ${repo}`,
     `Repo path: ${workspace}`,
-    'Git identity configured — commits as Ronan Hevenor. No AI attribution.',
+    'Git identity configured — commits as RonanHevenor. No AI attribution.',
     'Be precise — match existing production patterns.',
   ].join('\n');
 
