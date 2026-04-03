@@ -35,6 +35,7 @@ const BOT_REPO_BASE = process.env.BOT_REPO_BASE || '/home/poly/forest-workspaces
 const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-pro-preview,gemini-2.5-pro,gemini-3-flash-preview').split(',');
 
 const LOCKFILE     = '/tmp/forest.lock';
+const QUOTA_NOTIF_FILE = '/tmp/forest-quota-notified.json';
 const MAX_CYCLES   = 5;
 const ISSUE_IMAGE_ROOT = '/tmp/forest-issue-images';
 const MAX_ISSUE_IMAGES = 6;
@@ -489,6 +490,14 @@ async function pipeline(repo) {
   const issueRefs = issues.map(i => `#${i.number}`).join(', ');
 
   if (!resumePR) {
+    // Clear quota notification state if we are successfully starting a new run
+    if (existsSync(QUOTA_NOTIF_FILE)) {
+      const state = JSON.parse(readFileSync(QUOTA_NOTIF_FILE, 'utf8'));
+      if (state[repo] === issueRefs) {
+        delete state[repo];
+        writeFileSync(QUOTA_NOTIF_FILE, JSON.stringify(state));
+      }
+    }
     await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
   }
 
@@ -543,8 +552,20 @@ async function pipeline(repo) {
   const visualContext = buildVisualContextBlock(enrichedIssues);
 
   const exhaustedHandler = async () => {
-    const msg = `[${repo}] Found new issues but all Gemini models are exhausted.\n\nIssues:\n${issueList}\n\nWill retry on next timer tick.`;
-    await ntfyPost(msg, `forest — Quota Exhausted (${repo})`, 'default');
+    let alreadyNotified = false;
+    const state = existsSync(QUOTA_NOTIF_FILE) ? JSON.parse(readFileSync(QUOTA_NOTIF_FILE, 'utf8')) : {};
+    
+    if (state[repo] === issueRefs) {
+      alreadyNotified = true;
+    }
+
+    if (!alreadyNotified) {
+      const msg = `[${repo}] Found new issues but all Gemini models are exhausted.\n\nIssues:\n${issueList}\n\nforest will automatically retry every 60 seconds and start as soon as credits reset.`;
+      await ntfyPost(msg, `forest — Quota Exhausted (${repo})`, 'default');
+      state[repo] = issueRefs;
+      writeFileSync(QUOTA_NOTIF_FILE, JSON.stringify(state));
+    }
+    log(`All Gemini models exhausted for ${repo}. Notification logic handled.`);
   };
 
   // ── 1: Plan 
