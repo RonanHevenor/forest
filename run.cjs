@@ -4,10 +4,6 @@
 /**
  * forest
  * Automated issue resolution agent.
- * 
- * Pipeline:
- * 1. Draft & Implement: Plan and apply changes autonomously.
- * 2. Verify & Fix: Review diff, apply fixes, and run lint/typecheck (Iterative).
  */
 
 const { spawnSync }                                   = require('child_process');
@@ -44,6 +40,7 @@ const GIT_EMAIL = process.env.GIT_EMAIL || 'forest@example.com';
 const LOCKFILE     = '/tmp/forest.lock';
 const QUOTA_NOTIF_FILE = '/tmp/forest-quota-notified.json';
 const NO_PROGRESS_FILE = '/tmp/forest-no-progress.json';
+const TRANSCRIPT_DIR = join(__dirname, 'transcripts');
 const MAX_CYCLES   = 5;
 const ISSUE_IMAGE_ROOT = '/tmp/forest-issue-images';
 const MAX_ISSUE_IMAGES = 6;
@@ -292,23 +289,33 @@ function getIssueImageArgs(issues) {
 
 function runAgent(label, bin, args, cwd, { input, captureOutput = true } = {}) {
   log(`▶ [${label}] starting...`);
+  
+  if (!existsSync(TRANSCRIPT_DIR)) mkdirSync(TRANSCRIPT_DIR, { recursive: true });
+  const transcriptPath = join(TRANSCRIPT_DIR, `${label.replace(/[:/]/g, '-')}-${Date.now()}.txt`);
+
   const result = spawnSync(bin, args, {
     cwd,
     encoding: 'utf8',
     stdio: input !== undefined
-      ? ['pipe', captureOutput ? 'pipe' : 'ignore', captureOutput ? 'pipe' : 'ignore']
-      : ['ignore', captureOutput ? 'pipe' : 'ignore', captureOutput ? 'pipe' : 'ignore'],
+      ? ['pipe', 'pipe', 'pipe']
+      : ['ignore', 'pipe', 'pipe'],
     ...(input !== undefined ? { input } : {}),
     maxBuffer: AGENT_MAX_BUFFER,
     timeout: 45 * 60 * 1000,
     env: { ...process.env, HOME: '/home/poly' },
   });
 
+  const stdout = (result.stdout || '').trim();
+  const stderr = (result.stderr || '').trim();
+  
+  // Save full transcript (reasoning + tools + output)
+  writeFileSync(transcriptPath, `--- STDOUT ---\n${stdout}\n\n--- STDERR ---\n${stderr}`);
+
   if (result.error) throw new Error(`[${label}] spawn error: ${result.error.message}`);
   if (result.status !== 0) throw new Error(formatAgentFailure(label, result));
 
-  const out = captureOutput ? (result.stdout || '').trim() : '';
-  log(`✓ [${label}] done (${out.length} chars output)`);
+  const out = captureOutput ? stdout : '';
+  log(`✓ [${label}] done (transcript: ${transcriptPath})`);
   return out;
 }
 
