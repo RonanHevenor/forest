@@ -385,25 +385,52 @@ function getPRFeedback(prUrl, repo) {
   }
 }
 
-async function waitForApproval(prUrl, repo) {
-  log(`Waiting for ${GIT_NAME} to review/approve PR: ${prUrl}`);
+async function waitForApproval(prUrl, repo, since) {
+  log(`Waiting for ${GIT_NAME} to review/approve PR: ${prUrl} (ignoring feedback before ${since.toISOString()})`);
+  
   while (true) {
     try {
       const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${repo} --json reviews,comments,state`));
-      const approval = (data.reviews || []).find(r => r.author.login === GIT_NAME && r.state === 'APPROVED');
+      
+      // 1. Check for Approval (only if submitted after "since")
+      const approval = (data.reviews || []).find(r => 
+        r.author.login === GIT_NAME && 
+        r.state === 'APPROVED' &&
+        new Date(r.submittedAt || 0) > since
+      );
       if (approval) return 'merge';
-      const changesRequested = (data.reviews || []).find(r => r.author.login === GIT_NAME && r.state === 'CHANGES_REQUESTED');
+      
+      // 2. Check for "Request Changes" (only if submitted after "since")
+      const changesRequested = (data.reviews || []).find(r => 
+        r.author.login === GIT_NAME && 
+        r.state === 'CHANGES_REQUESTED' &&
+        new Date(r.submittedAt || 0) > since
+      );
       if (changesRequested) return 'iterate';
-      const allComments = [...(data.comments || []), ...(data.reviews || []).map(r => ({ body: r.body, author: r.author })), ...(data.reviews || []).flatMap(r => r.comments || [])];
+      
+      // 3. Check for keywords in comments (only if created after "since")
+      const allComments = [
+        ...(data.comments || []),
+        ...(data.reviews || []).map(r => ({ body: r.body, author: r.author, createdAt: r.submittedAt })),
+        ...(data.reviews || []).flatMap(r => (r.comments || []).map(lc => ({ ...lc, createdAt: lc.createdAt })))
+      ];
+      
       for (const c of allComments) {
         if (!c || !c.author || c.author.login !== GIT_NAME) continue;
+        if (new Date(c.createdAt || 0) <= since) continue;
+
         const msg = (c.body || '').trim().toLowerCase();
         if (msg.includes('/merge')) return 'merge';
         if (msg.includes('/iterate')) return 'iterate';
         if (msg.includes('/stop')) return 'stop';
       }
+      
       if (data.state === 'MERGED' || data.state === 'CLOSED') return 'stop';
-    } catch (e) { log(`Error polling PR: ${e.message}`); }
+
+    } catch (e) {
+      log(`Error polling PR: ${e.message}`);
+    }
+    
     await new Promise(r => setTimeout(r, 30000)); 
   }
 }
@@ -611,9 +638,12 @@ async function pipeline(repo) {
     }
 
     const proposal = [`[${repo}] Issue resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', `Review on GitHub:`, '• APPROVE to merge', '• REQUEST CHANGES to fix', '• Comment "/stop" to quit'].join('\n');
+    
+    // Capture time BEFORE sending notification so we ignore comments from the past
+    const since = new Date();
     await ntfyPost(proposal, `forest — Approval (${repo})`, 'high');
 
-    const decision = await waitForApproval(prUrl, repo);
+    const decision = await waitForApproval(prUrl, repo, since);
     if (decision === 'merge') {
       exec(`gh pr merge ${prUrl} --squash --delete-branch --admin --repo ${repo}`);
       for (const issue of issues) exec(`gh issue close ${issue.number} --repo ${repo} --comment "Resolved by ${prUrl}"`, { allowFailure: true });
