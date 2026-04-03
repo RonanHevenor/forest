@@ -3,7 +3,11 @@
 
 /**
  * forest
- * Automated issue resolution pipeline.
+ * Automated issue resolution agent.
+ * 
+ * Pipeline:
+ * 1. Draft & Implement: Plan and apply changes autonomously.
+ * 2. Verify & Fix: Review diff, apply fixes, and run lint/typecheck (Iterative).
  */
 
 const { spawnSync }                                   = require('child_process');
@@ -354,24 +358,15 @@ function getPRFeedback(prUrl, repo) {
   try {
     const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${repo} --json reviews,comments`));
     const feedback = [];
-    
-    // Top-level comments
     for (const c of (data.comments || [])) {
-      if (c.author.login === 'RonanHevenor') {
-        feedback.push(`Comment from RonanHevenor: ${c.body}`);
-      }
+      if (c.author.login === 'RonanHevenor') feedback.push(`Comment from RonanHevenor: ${c.body}`);
     }
-    
-    // Reviews
     for (const r of (data.reviews || [])) {
       if (r.author.login === 'RonanHevenor') {
         if (r.body) feedback.push(`Review from RonanHevenor (${r.state}): ${r.body}`);
-        for (const lc of (r.comments || [])) {
-          feedback.push(`Code comment from RonanHevenor on ${lc.path}:${lc.line}: ${lc.body}`);
-        }
+        for (const lc of (r.comments || [])) feedback.push(`Code comment from RonanHevenor on ${lc.path}:${lc.line}: ${lc.body}`);
       }
     }
-    
     return feedback.length > 0 ? feedback.join('\n\n---\n\n') : null;
   } catch (e) {
     log(`Warning: Failed to fetch PR feedback: ${e.message}`);
@@ -381,23 +376,14 @@ function getPRFeedback(prUrl, repo) {
 
 async function waitForApproval(prUrl, repo) {
   log(`Waiting for RonanHevenor to review/approve PR: ${prUrl}`);
-  
   while (true) {
     try {
       const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${repo} --json reviews,comments,state`));
-      
       const approval = (data.reviews || []).find(r => r.author.login === 'RonanHevenor' && r.state === 'APPROVED');
       if (approval) return 'merge';
-      
       const changesRequested = (data.reviews || []).find(r => r.author.login === 'RonanHevenor' && r.state === 'CHANGES_REQUESTED');
       if (changesRequested) return 'iterate';
-      
-      const allComments = [
-        ...(data.comments || []),
-        ...(data.reviews || []).map(r => ({ body: r.body, author: r.author })),
-        ...(data.reviews || []).flatMap(r => r.comments || [])
-      ];
-      
+      const allComments = [...(data.comments || []), ...(data.reviews || []).map(r => ({ body: r.body, author: r.author })), ...(data.reviews || []).flatMap(r => r.comments || [])];
       for (const c of allComments) {
         if (!c || !c.author || c.author.login !== 'RonanHevenor') continue;
         const msg = (c.body || '').trim().toLowerCase();
@@ -405,13 +391,8 @@ async function waitForApproval(prUrl, repo) {
         if (msg.includes('/iterate')) return 'iterate';
         if (msg.includes('/stop')) return 'stop';
       }
-      
       if (data.state === 'MERGED' || data.state === 'CLOSED') return 'stop';
-
-    } catch (e) {
-      log(`Error polling PR: ${e.message}`);
-    }
-    
+    } catch (e) { log(`Error polling PR: ${e.message}`); }
     await new Promise(r => setTimeout(r, 30000)); 
   }
 }
@@ -457,22 +438,15 @@ async function pipeline(repo) {
     resumePR = botPRs[0];
     branch = resumePR.headRefName;
     log(`[${repo}] Resuming existing bot PR #${resumePR.number} (${branch}).`);
-    
     const bodyText = resumePR.body || '';
     const issueMatches = bodyText.match(/#[0-9]+/g);
-    if (issueMatches) {
-      manualIssueNumbers = Array.from(new Set(issueMatches.map(s => s.replace('#', ''))));
-    }
+    if (issueMatches) manualIssueNumbers = Array.from(new Set(issueMatches.map(s => s.replace('#', ''))));
   }
 
   let issues = [];
   if (manualIssueNumbers.length > 0) {
     for (const num of manualIssueNumbers) {
-      try {
-        issues.push(JSON.parse(exec(`gh issue view ${num} --repo ${repo} --json number,title,body,labels,comments`)));
-      } catch (e) {
-        log(`Failed to fetch resumed issue #${num}: ${e.message}`);
-      }
+      try { issues.push(JSON.parse(exec(`gh issue view ${num} --repo ${repo} --json number,title,body,labels,comments`))); } catch (e) { log(`Failed to fetch resumed issue #${num}: ${e.message}`); }
     }
   }
 
@@ -490,13 +464,9 @@ async function pipeline(repo) {
   const issueRefs = issues.map(i => `#${i.number}`).join(', ');
 
   if (!resumePR) {
-    // Clear quota notification state if we are successfully starting a new run
     if (existsSync(QUOTA_NOTIF_FILE)) {
       const state = JSON.parse(readFileSync(QUOTA_NOTIF_FILE, 'utf8'));
-      if (state[repo] === issueRefs) {
-        delete state[repo];
-        writeFileSync(QUOTA_NOTIF_FILE, JSON.stringify(state));
-      }
+      if (state[repo] === issueRefs) { delete state[repo]; writeFileSync(QUOTA_NOTIF_FILE, JSON.stringify(state)); }
     }
     await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
   }
@@ -520,7 +490,6 @@ async function pipeline(repo) {
     exec(`git -C ${workspace} clean -fd`);
   }
   
-  // Install deps if package.json exists
   if (existsSync(join(workspace, 'package.json'))) {
     log(`[${repo}] Installing dependencies...`);
     exec(`pnpm -C ${workspace} install --no-frozen-lockfile`, { allowFailure: true });
@@ -554,28 +523,20 @@ async function pipeline(repo) {
   const exhaustedHandler = async () => {
     let alreadyNotified = false;
     const state = existsSync(QUOTA_NOTIF_FILE) ? JSON.parse(readFileSync(QUOTA_NOTIF_FILE, 'utf8')) : {};
-    
-    if (state[repo] === issueRefs) {
-      alreadyNotified = true;
-    }
-
+    if (state[repo] === issueRefs) alreadyNotified = true;
     if (!alreadyNotified) {
-      const msg = `[${repo}] Found new issues but all Gemini models are exhausted.\n\nIssues:\n${issueList}\n\nforest will automatically retry every 60 seconds and start as soon as credits reset.`;
+      const msg = `[${repo}] Found new issues but all Gemini models are exhausted.\n\nIssues:\n${issueList}\n\nforest will automatically retry every 60 seconds.`;
       await ntfyPost(msg, `forest — Quota Exhausted (${repo})`, 'default');
       state[repo] = issueRefs;
       writeFileSync(QUOTA_NOTIF_FILE, JSON.stringify(state));
     }
-    log(`All Gemini models exhausted for ${repo}. Notification logic handled.`);
+    log(`All Gemini models exhausted for ${repo}.`);
   };
 
-  // ── 1: Plan 
-  const planPrompt = `${codebaseCtx}\nAnalyze these issues and produce a thorough, step-by-step implementation plan.\n\n## Visual Context\n${visualContext}\n\n${issueText}`;
-  const plan = await runGemini(`${repo}:plan`, [...issueImageArgs, '-p', planPrompt, '-y', '--output-format', 'text'], workspace, { onAllExhausted: exhaustedHandler });
-
-  // ── 2: Implement (Skip if resuming)
+  // ── Stage 1: Draft & Implement
   if (!resumePR) {
-    const implPrompt = `${codebaseCtx}\nImplement the plan. Edit necessary files. Edits only.\n\n## Issues\n${issueText}\n\n## Plan\n${plan}`;
-    await runGemini(`${repo}:impl`, [...issueImageArgs, '-p', implPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], workspace, { onAllExhausted: exhaustedHandler });
+    const draftPrompt = `${codebaseCtx}\nAnalyze these issues and implement a solution. First, write a technical plan, then apply the code changes autonomously.\n\n## Visual Context\n${visualContext}\n\n${issueText}`;
+    await runGemini(`${repo}:draft`, [...issueImageArgs, '-p', draftPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], workspace, { onAllExhausted: exhaustedHandler });
   }
 
   let cycleCount = 0;
@@ -588,18 +549,14 @@ async function pipeline(repo) {
     const userFeedback = prUrl ? getPRFeedback(prUrl, repo) : null;
     const feedbackCtx = userFeedback ? `\n\n## Human Review Feedback (HIGH PRIORITY)\n${userFeedback}` : '';
 
-    // ── 3: Evaluate
+    // ── Stage 2: Verify & Fix
     const fullDiff      = exec(`git -C ${workspace} diff origin/main`, { allowFailure: true });
     const untracked     = exec(`git -C ${workspace} ls-files --others --exclude-standard`, { allowFailure: true });
     const diffSection   = fullDiff  ? `\`\`\`diff\n${fullDiff}\n\`\`\`` : '(no changes)';
     const newFiles      = untracked ? `\n## New Files\n${untracked}` : '';
 
-    const evalPrompt = `${codebaseCtx}\nReview these changes. Identify bugs, regressions, or type errors.${feedbackCtx}\n\n## Issues\n${issueText}\n\n## Plan\n${plan}\n\n## Changes\n${diffSection}${newFiles}`;
-    const evaluation = await runGemini(`${repo}:eval:c${cycleCount}`, [...issueImageArgs, '-p', evalPrompt, '-y', '--output-format', 'text'], workspace, { onAllExhausted: exhaustedHandler });
-
-    // ── 4: Fix
-    const fixPrompt = `${codebaseCtx}\nFix issues Gemini identified and address human feedback.${feedbackCtx}\n\n## Gemini Review\n${evaluation}\n\n## Changes\n${diffSection}\n\nInstructions:\n- BEFORE COMMITTING: run existing lint/test scripts if available.\n- Commit referencing ${issueRefs}. No push.`;
-    await runGemini(`${repo}:fix:c${cycleCount}`, [...issueImageArgs, '-p', fixPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], workspace, { onAllExhausted: exhaustedHandler });
+    const verifyPrompt = `${codebaseCtx}\nReview the current changes and fix any remaining issues, bugs, or type errors.${feedbackCtx}\n\n## Issues\n${issueText}\n\n## Changes to Review\n${diffSection}${newFiles}\n\nInstructions:\n- Read code carefully to match existing patterns.\n- If you modified package.json or collections, run \`pnpm install\` and \`pnpm generate:types\`.\n- BEFORE COMMITTING: you MUST run existing lint/typecheck scripts.\n- Commit referencing ${issueRefs}. No push.`;
+    await runGemini(`${repo}:verify:c${cycleCount}`, [...issueImageArgs, '-p', verifyPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], workspace, { onAllExhausted: exhaustedHandler });
 
     const commits = exec(`git -C ${workspace} log origin/main..HEAD --format="• %s"`, { allowFailure: true });
     if (!commits) break;
@@ -607,51 +564,29 @@ async function pipeline(repo) {
     exec(`git -C ${workspace} push -f -u origin ${branch}`);
 
     if (!prUrl) {
-      const titlePrompt = `Write a PR title for these changes.\n\nIssues:\n${issueRefs}\n\nCommits:\n${commits}`;
+      const titlePrompt = `Write a PR title summarizing these changes: ${issueRefs}`;
       const prTitleRaw = await runGemini(`${repo}:title`, ['-p', titlePrompt, '-y', '--output-format', 'text'], workspace);
       const prTitle = prTitleRaw.split('\n')[0].trim().slice(0, 72);
-      
       const resolvesList = issues.map(i => `Resolves #${i.number}`).join('\n');
       const prBodyFile = `/tmp/forest-pr-body-${Date.now()}.txt`;
-      writeFileSync(prBodyFile, `${resolvesList}\n\n## Gemini Review\n${evaluation}`);
-      try {
-        prUrl = exec(`gh pr create --repo ${repo} --title ${JSON.stringify(prTitle)} --body-file ${prBodyFile} --head ${branch} --base main`);
-      } finally {
-        try { unlinkSync(prBodyFile); } catch {}
-      }
+      writeFileSync(prBodyFile, `${resolvesList}\n\n${issueList}`);
+      try { prUrl = exec(`gh pr create --repo ${repo} --title ${JSON.stringify(prTitle)} --body-file ${prBodyFile} --head ${branch} --base main`); } finally { try { unlinkSync(prBodyFile); } catch {} }
     }
 
-    const proposal = [
-      `[${repo}] ${issues.length} issue(s) resolved. Cycle ${cycleCount} complete.`,
-      `PR: ${prUrl}`,
-      '',
-      'Please review on GitHub:',
-      '• APPROVE to merge',
-      '• REQUEST CHANGES to trigger a fix cycle',
-      '• Comment "/stop" to shutdown timer',
-    ].join('\n');
-
-    await ntfyPost(proposal, `forest — Approval (${repo} C${cycleCount})`, 'high');
+    const proposal = [`[${repo}] Issue resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', 'Review on GitHub:', '• APPROVE to merge', '• REQUEST CHANGES to fix', '• Comment "/stop" to quit'].join('\n');
+    const since = Math.floor(Date.now() / 1000);
+    await ntfyPost(proposal, `forest — Approval (${repo})`, 'high');
 
     const decision = await waitForApproval(prUrl, repo);
     if (decision === 'merge') {
       exec(`gh pr merge ${prUrl} --squash --delete-branch --admin --repo ${repo}`);
-      for (const issue of issues) {
-        exec(`gh issue close ${issue.number} --repo ${repo} --comment "Resolved by ${prUrl}"`, { allowFailure: true });
-      }
+      for (const issue of issues) exec(`gh issue close ${issue.number} --repo ${repo} --comment "Resolved by ${prUrl}"`, { allowFailure: true });
       await ntfyPost(`[${repo}] Merged!`, `forest — Deployed (${repo})`, 'high');
       break;
-    } else if (decision === 'iterate') {
-      continue;
-    } else if (decision === 'stop') {
-      exec('systemctl --user stop forest.timer');
-      await ntfyPost('Stopped.', 'forest — Stopped');
-      process.exit(0);
-    } else {
-      break;
-    }
+    } else if (decision === 'iterate') continue;
+    else if (decision === 'stop') { exec('systemctl --user stop forest.timer'); process.exit(0); }
+    else break;
   }
-
   try { if (existsSync(`${ISSUE_IMAGE_ROOT}/${stampForImages}`)) rmSync(`${ISSUE_IMAGE_ROOT}/${stampForImages}`, { recursive: true, force: true }); } catch {}
 }
 
