@@ -392,7 +392,6 @@ async function waitForApproval(prUrl, repo, since) {
     try {
       const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${repo} --json reviews,comments,state`));
       
-      // 1. Check for Approval (only if submitted after "since")
       const approval = (data.reviews || []).find(r => 
         r.author.login === GIT_NAME && 
         r.state === 'APPROVED' &&
@@ -400,7 +399,6 @@ async function waitForApproval(prUrl, repo, since) {
       );
       if (approval) return 'merge';
       
-      // 2. Check for "Request Changes" (only if submitted after "since")
       const changesRequested = (data.reviews || []).find(r => 
         r.author.login === GIT_NAME && 
         r.state === 'CHANGES_REQUESTED' &&
@@ -408,7 +406,6 @@ async function waitForApproval(prUrl, repo, since) {
       );
       if (changesRequested) return 'iterate';
       
-      // 3. Check for keywords in comments (only if created after "since")
       const allComments = [
         ...(data.comments || []),
         ...(data.reviews || []).map(r => ({ body: r.body, author: r.author, createdAt: r.submittedAt })),
@@ -438,6 +435,14 @@ async function waitForApproval(prUrl, repo, since) {
 // ─── Core ─────────────────────────────────────────────────────────────────────
 
 async function run() {
+  // 1. Self-update: pull latest logic from GitHub before starting
+  try {
+    log('Checking for self-updates...');
+    exec(`git -C ${__dirname} fetch origin && git -C ${__dirname} reset --hard origin/main`);
+  } catch (e) {
+    log(`Warning: Self-update failed: ${e.message}`);
+  }
+
   if (existsSync(LOCKFILE)) {
     const pid = readFileSync(LOCKFILE, 'utf8').trim();
     try {
@@ -639,7 +644,6 @@ async function pipeline(repo) {
 
     const proposal = [`[${repo}] Issue resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', `Review on GitHub:`, '• APPROVE to merge', '• REQUEST CHANGES to fix', '• Comment "/stop" to quit'].join('\n');
     
-    // Capture time BEFORE sending notification so we ignore comments from the past
     const since = new Date();
     await ntfyPost(proposal, `forest — Approval (${repo})`, 'high');
 
