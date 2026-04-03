@@ -59,6 +59,10 @@ function execArgs(bin, args, opts = {}) {
     stdio: ['ignore', 'pipe', 'pipe'],
     ...opts,
   });
+  if (result.error) {
+    if (opts.allowFailure) return '';
+    throw new Error(`Command failed to start: ${bin} ${args.join(' ')}\n${result.error.message}`);
+  }
   if (result.status !== 0 && !opts.allowFailure) {
     const msg = (result.stderr || '').trim() || `exit ${result.status}`;
     throw new Error(`Command failed: ${bin} ${args.join(' ')}\n${msg}`);
@@ -605,11 +609,11 @@ async function pipeline(repo) {
       const prTitleRaw = await runGemini(`${repo}:title`, ['-p', titlePrompt, '-y', '--output-format', 'text'], workspace);
       
       const titleLines = prTitleRaw.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-      const preambleWithColon = /^(?:sure|here|proposed|below|this|i|my|the|an|title|summary|ok|okay|pr|as requested).*?[:]\s*/i;
+      const preambleWithColon = /^(?:sure|here|proposed|below|this|i|my|the|an?|title|summary|ok|okay|pr|as requested).*?[:]+\s*/i;
       const noiseOnly = /^(?:sure|here|below|ok|okay|hi|hello|yes|i have (?:applied|updated).*|thanks|thank you|as requested)[!.]?$/i;
 
       let candidates = titleLines
-        .map(l => l.replace(preambleWithColon, '').replace(/^["']|["']$/g, '').trim())
+        .map(l => l.replace(preambleWithColon, '').replace(/^[*_"`' \t]+|[*_"`' \t]+$/g, '').trim())
         .filter(l => l.length > 0 && !noiseOnly.test(l));
 
       let prTitle = candidates[0] || 'Update';
