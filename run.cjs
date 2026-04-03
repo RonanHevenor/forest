@@ -398,7 +398,7 @@ async function waitForApproval(prUrl, repo, since) {
       const approval = (data.reviews || []).find(r => 
         r.author.login === GIT_NAME && 
         r.state === 'APPROVED' &&
-        new Date(r.submittedAt || r.createdAt || 0) > since
+        new Date(r.submittedAt || 0) > since
       );
       if (approval) return 'merge';
       
@@ -437,6 +437,14 @@ async function waitForApproval(prUrl, repo, since) {
 // ─── Core ─────────────────────────────────────────────────────────────────────
 
 async function run() {
+  // 1. Self-update: pull latest logic from GitHub before starting
+  try {
+    log('Checking for self-updates...');
+    exec(`git -C ${__dirname} fetch origin && git -C ${__dirname} reset --hard origin/main`);
+  } catch (e) {
+    log(`Warning: Self-update failed: ${e.message}`);
+  }
+
   if (existsSync(LOCKFILE)) {
     const pid = readFileSync(LOCKFILE, 'utf8').trim();
     try {
