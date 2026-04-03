@@ -32,7 +32,7 @@ const NTFY_TOPIC = process.env.NTFY_TOPIC || 'forest-agent-notifications';
 const NTFY_URL   = `https://ntfy.sh/${NTFY_TOPIC}`;
 const TARGET_REPOS = (process.env.GITHUB_REPO || 'thepoly/polymer').split(',');
 const BOT_REPO_BASE = process.env.BOT_REPO_BASE || '/home/poly/forest-workspaces';
-const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-pro-preview,gemini-2.5-pro,gemini-3-flash-preview').split(',');
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-pro-preview,gemini-3-flash-preview').split(',');
 
 const LOCKFILE     = '/tmp/forest.lock';
 const QUOTA_NOTIF_FILE = '/tmp/forest-quota-notified.json';
