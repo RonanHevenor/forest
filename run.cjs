@@ -4,10 +4,6 @@
 /**
  * forest
  * Automated issue resolution agent.
- * 
- * Pipeline:
- * 1. Draft & Implement: Plan and apply changes autonomously.
- * 2. Verify & Fix: Review diff, apply fixes, and run lint/typecheck (Iterative).
  */
 
 const { spawnSync }                                   = require('child_process');
@@ -40,6 +36,7 @@ const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-pro-preview,gemi
 
 const LOCKFILE     = '/tmp/forest.lock';
 const QUOTA_NOTIF_FILE = '/tmp/forest-quota-notified.json';
+const NO_PROGRESS_FILE = '/tmp/forest-no-progress.json';
 const MAX_CYCLES   = 5;
 const ISSUE_IMAGE_ROOT = '/tmp/forest-issue-images';
 const MAX_ISSUE_IMAGES = 6;
@@ -464,11 +461,22 @@ async function pipeline(repo) {
   const issueRefs = issues.map(i => `#${i.number}`).join(', ');
 
   if (!resumePR) {
+    // Check for "no progress" state to avoid spam
+    if (existsSync(NO_PROGRESS_FILE)) {
+      const state = JSON.parse(readFileSync(NO_PROGRESS_FILE, 'utf8'));
+      if (state[repo] === issueRefs) {
+        log(`[${repo}] Already reported no progress for these issues. Skipping notification.`);
+      } else {
+        await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
+      }
+    } else {
+      await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
+    }
+
     if (existsSync(QUOTA_NOTIF_FILE)) {
       const state = JSON.parse(readFileSync(QUOTA_NOTIF_FILE, 'utf8'));
       if (state[repo] === issueRefs) { delete state[repo]; writeFileSync(QUOTA_NOTIF_FILE, JSON.stringify(state)); }
     }
-    await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
   }
 
   log(`[${repo}] Processing ${issues.length} issue(s): ${issues.map(i => '#' + i.number).join(', ')}`);
@@ -535,7 +543,7 @@ async function pipeline(repo) {
 
   // ── Stage 1: Draft & Implement
   if (!resumePR) {
-    const draftPrompt = `${codebaseCtx}\nAnalyze these issues and implement a solution. First, write a technical plan, then apply the code changes autonomously.\n\n## Visual Context\n${visualContext}\n\n${issueText}`;
+    const draftPrompt = `${codebaseCtx}\nAnalyze these issues and implement a solution. First, write a technical plan, then apply the code changes autonomously. You MUST actually edit files using the provided tools.\n\n## Visual Context\n${visualContext}\n\n${issueText}`;
     await runGemini(`${repo}:draft`, [...issueImageArgs, '-p', draftPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], workspace, { onAllExhausted: exhaustedHandler });
   }
 
@@ -555,11 +563,27 @@ async function pipeline(repo) {
     const diffSection   = fullDiff  ? `\`\`\`diff\n${fullDiff}\n\`\`\`` : '(no changes)';
     const newFiles      = untracked ? `\n## New Files\n${untracked}` : '';
 
-    const verifyPrompt = `${codebaseCtx}\nReview the current changes and fix any remaining issues, bugs, or type errors.${feedbackCtx}\n\n## Issues\n${issueText}\n\n## Changes to Review\n${diffSection}${newFiles}\n\nInstructions:\n- Read code carefully to match existing patterns.\n- If you modified package.json or collections, run \`pnpm install\` and \`pnpm generate:types\`.\n- BEFORE COMMITTING: you MUST run existing lint/typecheck scripts.\n- Commit referencing ${issueRefs}. No push.`;
+    const verifyPrompt = `${codebaseCtx}\nReview the current changes and fix any remaining issues, bugs, or type errors.${feedbackCtx}\n\n## Issues\n${issueText}\n\n## Changes to Review\n${diffSection}${newFiles}\n\nInstructions:\n- Read code carefully to match existing patterns.\n- If you modified package.json or collections, run \`pnpm install\` and \`pnpm generate:types\`.\n- BEFORE COMMITTING: you MUST run existing lint/typecheck scripts.\n- If you made changes, stage all and commit referencing ${issueRefs}.\n- If no more changes are needed, explicitly state that you are done.`;
     await runGemini(`${repo}:verify:c${cycleCount}`, [...issueImageArgs, '-p', verifyPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], workspace, { onAllExhausted: exhaustedHandler });
 
     const commits = exec(`git -C ${workspace} log origin/main..HEAD --format="• %s"`, { allowFailure: true });
-    if (!commits) break;
+    
+    if (!commits) {
+      log(`[${repo}] No changes made in cycle ${cycleCount}.`);
+      const noProgressState = existsSync(NO_PROGRESS_FILE) ? JSON.parse(readFileSync(NO_PROGRESS_FILE, 'utf8')) : {};
+      noProgressState[repo] = issueRefs;
+      writeFileSync(NO_PROGRESS_FILE, JSON.stringify(noProgressState));
+      break;
+    }
+
+    // Reset progress tracking if we actually committed something
+    if (existsSync(NO_PROGRESS_FILE)) {
+      const noProgressState = JSON.parse(readFileSync(NO_PROGRESS_FILE, 'utf8'));
+      if (noProgressState[repo] === issueRefs) {
+        delete noProgressState[repo];
+        writeFileSync(NO_PROGRESS_FILE, JSON.stringify(noProgressState));
+      }
+    }
 
     exec(`git -C ${workspace} push -f -u origin ${branch}`);
 
@@ -574,7 +598,6 @@ async function pipeline(repo) {
     }
 
     const proposal = [`[${repo}] Issue resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', 'Review on GitHub:', '• APPROVE to merge', '• REQUEST CHANGES to fix', '• Comment "/stop" to quit'].join('\n');
-    const since = Math.floor(Date.now() / 1000);
     await ntfyPost(proposal, `forest — Approval (${repo})`, 'high');
 
     const decision = await waitForApproval(prUrl, repo);
