@@ -4,6 +4,10 @@
 /**
  * forest
  * Automated issue resolution agent.
+ * 
+ * Pipeline:
+ * 1. Draft & Implement: Plan and apply changes autonomously.
+ * 2. Verify & Fix: Review diff, apply fixes, and run lint/typecheck (Iterative).
  */
 
 const { spawnSync }                                   = require('child_process');
@@ -33,6 +37,9 @@ const NTFY_URL   = `https://ntfy.sh/${NTFY_TOPIC}`;
 const TARGET_REPOS = (process.env.GITHUB_REPO || 'thepoly/polymer').split(',');
 const BOT_REPO_BASE = process.env.BOT_REPO_BASE || '/home/poly/forest-workspaces';
 const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-pro-preview,gemini-3-flash-preview').split(',');
+
+const GIT_NAME = process.env.GIT_NAME || 'forest-agent';
+const GIT_EMAIL = process.env.GIT_EMAIL || 'forest@example.com';
 
 const LOCKFILE     = '/tmp/forest.lock';
 const QUOTA_NOTIF_FILE = '/tmp/forest-quota-notified.json';
@@ -67,21 +74,6 @@ function formatAgentFailure(label, result) {
   const stderr = (result.stderr || '').trim();
   const details = stderr || stdout;
   return `[${label}] exited ${result.status}${details ? ':\n' + details : ''}`;
-}
-
-function getForestVersion() {
-  try {
-    const commits = parseInt(exec(`git -C ${__dirname} rev-list --count HEAD`, { allowFailure: true }), 10);
-    if (isNaN(commits)) return '1.0.0';
-    const baseCommits = 8;
-    const n = Math.max(0, commits - baseCommits);
-    const major = 1 + Math.floor(n / 100);
-    const minor = Math.floor((n % 100) / 10);
-    const patch = n % 10;
-    return `${major}.${minor}.${patch}`;
-  } catch {
-    return '1.0.0';
-  }
 }
 
 function isGeminiLimitMessage(text) {
@@ -354,7 +346,7 @@ async function ntfyPost(body, title, priority = 'default') {
     try {
       const response = await fetch(NTFY_URL, {
         method: 'POST',
-        headers: { 'Title': headerSafeTitle, 'Priority': priority, 'User-Agent': 'forest' },
+        headers: { 'Title': headerSafeTitle, 'Priority': priority, 'Tags': 'robot', 'User-Agent': 'forest' },
         body,
         signal: AbortSignal.timeout(15000),
       });
@@ -371,12 +363,12 @@ function getPRFeedback(prUrl, repo) {
     const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${repo} --json reviews,comments`));
     const feedback = [];
     for (const c of (data.comments || [])) {
-      if (c.author.login === 'RonanHevenor') feedback.push(`Comment from RonanHevenor: ${c.body}`);
+      if (c.author.login === GIT_NAME) feedback.push(`Comment from ${GIT_NAME}: ${c.body}`);
     }
     for (const r of (data.reviews || [])) {
-      if (r.author.login === 'RonanHevenor') {
-        if (r.body) feedback.push(`Review from RonanHevenor (${r.state}): ${r.body}`);
-        for (const lc of (r.comments || [])) feedback.push(`Code comment from RonanHevenor on ${lc.path}:${lc.line}: ${lc.body}`);
+      if (r.author.login === GIT_NAME) {
+        if (r.body) feedback.push(`Review from ${GIT_NAME} (${r.state}): ${r.body}`);
+        for (const lc of (r.comments || [])) feedback.push(`Code comment from ${GIT_NAME} on ${lc.path}:${lc.line}: ${lc.body}`);
       }
     }
     return feedback.length > 0 ? feedback.join('\n\n---\n\n') : null;
@@ -387,17 +379,17 @@ function getPRFeedback(prUrl, repo) {
 }
 
 async function waitForApproval(prUrl, repo) {
-  log(`Waiting for RonanHevenor to review/approve PR: ${prUrl}`);
+  log(`Waiting for ${GIT_NAME} to review/approve PR: ${prUrl}`);
   while (true) {
     try {
       const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${repo} --json reviews,comments,state`));
-      const approval = (data.reviews || []).find(r => r.author.login === 'RonanHevenor' && r.state === 'APPROVED');
+      const approval = (data.reviews || []).find(r => r.author.login === GIT_NAME && r.state === 'APPROVED');
       if (approval) return 'merge';
-      const changesRequested = (data.reviews || []).find(r => r.author.login === 'RonanHevenor' && r.state === 'CHANGES_REQUESTED');
+      const changesRequested = (data.reviews || []).find(r => r.author.login === GIT_NAME && r.state === 'CHANGES_REQUESTED');
       if (changesRequested) return 'iterate';
       const allComments = [...(data.comments || []), ...(data.reviews || []).map(r => ({ body: r.body, author: r.author })), ...(data.reviews || []).flatMap(r => r.comments || [])];
       for (const c of allComments) {
-        if (!c || !c.author || c.author.login !== 'RonanHevenor') continue;
+        if (!c || !c.author || c.author.login !== GIT_NAME) continue;
         const msg = (c.body || '').trim().toLowerCase();
         if (msg.includes('/merge')) return 'merge';
         if (msg.includes('/iterate')) return 'iterate';
@@ -476,16 +468,15 @@ async function pipeline(repo) {
   const issueRefs = issues.map(i => `#${i.number}`).join(', ');
 
   if (!resumePR) {
-    // Check for "no progress" state to avoid spam
     if (existsSync(NO_PROGRESS_FILE)) {
       const state = JSON.parse(readFileSync(NO_PROGRESS_FILE, 'utf8'));
       if (state[repo] === issueRefs) {
         log(`[${repo}] Already reported no progress for these issues. Skipping notification.`);
       } else {
-        await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest ${getForestVersion()}`);
+        await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
       }
     } else {
-      await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest ${getForestVersion()}`);
+      await ntfyPost(`[${repo}] Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
     }
 
     if (existsSync(QUOTA_NOTIF_FILE)) {
@@ -505,8 +496,8 @@ async function pipeline(repo) {
   exec(`git -C ${workspace} fetch origin`);
   
   // Ensure correct identity in workspace
-  exec(`git -C ${workspace} config user.name "RonanHevenor"`);
-  exec(`git -C ${workspace} config user.email "spacechickenrobot@gmail.com"`);
+  exec(`git -C ${workspace} config user.name "${GIT_NAME}"`);
+  exec(`git -C ${workspace} config user.email "${GIT_EMAIL}"`);
   
   if (resumePR) {
     exec(`git -C ${workspace} checkout ${branch}`);
@@ -541,7 +532,7 @@ async function pipeline(repo) {
   const codebaseCtx = [
     `Codebase: ${repo}`,
     `Repo path: ${workspace}`,
-    'Git identity configured — commits as RonanHevenor. No AI attribution.',
+    `Git identity configured — commits as ${GIT_NAME}. No AI attribution.`,
     'Be precise — match existing production patterns.',
   ].join('\n');
 
@@ -553,7 +544,7 @@ async function pipeline(repo) {
     if (state[repo] === issueRefs) alreadyNotified = true;
     if (!alreadyNotified) {
       const msg = `[${repo}] Found new issues but all Gemini models are exhausted.\n\nIssues:\n${issueList}\n\nforest will automatically retry every 60 seconds.`;
-      await ntfyPost(msg, `forest ${getForestVersion()} — Quota Exhausted (${repo})`, 'default');
+      await ntfyPost(msg, `forest — Quota Exhausted (${repo})`, 'default');
       state[repo] = issueRefs;
       writeFileSync(QUOTA_NOTIF_FILE, JSON.stringify(state));
     }
@@ -595,13 +586,9 @@ async function pipeline(repo) {
       break;
     }
 
-    // Reset progress tracking if we actually committed something
     if (existsSync(NO_PROGRESS_FILE)) {
       const noProgressState = JSON.parse(readFileSync(NO_PROGRESS_FILE, 'utf8'));
-      if (noProgressState[repo] === issueRefs) {
-        delete noProgressState[repo];
-        writeFileSync(NO_PROGRESS_FILE, JSON.stringify(noProgressState));
-      }
+      if (noProgressState[repo] === issueRefs) { delete noProgressState[repo]; writeFileSync(NO_PROGRESS_FILE, JSON.stringify(noProgressState)); }
     }
 
     exec(`git -C ${workspace} push -f -u origin ${branch}`);
@@ -616,14 +603,14 @@ async function pipeline(repo) {
       try { prUrl = exec(`gh pr create --repo ${repo} --title ${JSON.stringify(prTitle)} --body-file ${prBodyFile} --head ${branch} --base main`); } finally { try { unlinkSync(prBodyFile); } catch {} }
     }
 
-    const proposal = [`[${repo}] Issue resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', 'Review on GitHub:', '• APPROVE to merge', '• REQUEST CHANGES to fix', '• Comment "/stop" to quit'].join('\n');
-    await ntfyPost(proposal, `forest ${getForestVersion()} — Approval (${repo})`, 'high');
+    const proposal = [`[${repo}] Issue resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', `Review on GitHub:`, '• APPROVE to merge', '• REQUEST CHANGES to fix', '• Comment "/stop" to quit'].join('\n');
+    await ntfyPost(proposal, `forest — Approval (${repo})`, 'high');
 
     const decision = await waitForApproval(prUrl, repo);
     if (decision === 'merge') {
       exec(`gh pr merge ${prUrl} --squash --delete-branch --admin --repo ${repo}`);
       for (const issue of issues) exec(`gh issue close ${issue.number} --repo ${repo} --comment "Resolved by ${prUrl}"`, { allowFailure: true });
-      await ntfyPost(`[${repo}] Merged!`, `forest ${getForestVersion()} — Deployed (${repo})`, 'high');
+      await ntfyPost(`[${repo}] Merged!`, `forest — Deployed (${repo})`, 'high');
       break;
     } else if (decision === 'iterate') continue;
     else if (decision === 'stop') { exec('systemctl --user stop forest.timer'); process.exit(0); }
@@ -634,7 +621,7 @@ async function pipeline(repo) {
 
 run().catch(async err => {
   log(`Fatal: ${err.message}`);
-  try { await ntfyPost(err.message.slice(0, 500), `forest ${getForestVersion()} — Crash`, 'urgent'); } catch {}
+  try { await ntfyPost(err.message.slice(0, 500), 'forest - Crash', 'urgent'); } catch {}
   try { unlinkSync(LOCKFILE); } catch {}
   process.exit(1);
 });
