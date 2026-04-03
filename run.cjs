@@ -601,9 +601,11 @@ async function pipeline(repo) {
     exec(`git -C ${workspace} push -f -u origin ${branch}`);
 
     if (!prUrl) {
-      const titlePrompt = `Write a PR title summarizing these changes: ${issueRefs}`;
+      const titlePrompt = `Write a concise PR title summarizing these changes: ${issueRefs}. Return ONLY the title string, without any preamble, explanation, or quotes.`;
       const prTitleRaw = await runGemini(`${repo}:title`, ['-p', titlePrompt, '-y', '--output-format', 'text'], workspace);
-      const prTitle = prTitleRaw.split('\n')[0].trim().slice(0, 72);
+      const titleLines = prTitleRaw.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+      let prTitle = titleLines.find(line => !/^(?:sure|here is|proposed|below is|i have|this is)/i.test(line)) || titleLines[0] || 'Update';
+      prTitle = prTitle.replace(/^["']|["']$/g, '').trim().slice(0, 72);
       const resolvesList = issues.map(i => `Resolves #${i.number}`).join('\n');
       const prBodyFile = `/tmp/forest-pr-body-${Date.now()}.txt`;
       writeFileSync(prBodyFile, `${resolvesList}\n\n${issueList}`);
