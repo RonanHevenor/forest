@@ -53,19 +53,6 @@ function log(msg) {
   console.log(`[${ts}] ${msg}`);
 }
 
-function exec(cmd, opts = {}) {
-  const result = spawnSync('bash', ['-c', cmd], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    ...opts,
-  });
-  if (result.status !== 0 && !opts.allowFailure) {
-    const msg = (result.stderr || '').trim() || `exit ${result.status}`;
-    throw new Error(`Command failed: ${cmd}\n${msg}`);
-  }
-  return (result.stdout || '').trim();
-}
-
 function execArgs(bin, args, opts = {}) {
   const result = spawnSync(bin, args, {
     encoding: 'utf8',
@@ -616,9 +603,23 @@ async function pipeline(repo) {
     if (!prUrl) {
       const titlePrompt = `Write a concise PR title summarizing these changes: ${issueRefs}. Return ONLY the title string, without any preamble, explanation, or quotes.`;
       const prTitleRaw = await runGemini(`${repo}:title`, ['-p', titlePrompt, '-y', '--output-format', 'text'], workspace);
-      const titleLines = prTitleRaw.split('\n').map(line => line.trim()).filter(line => line.length > 0);
-      let prTitle = titleLines.find(line => !/^(?:sure|here is|proposed|below is|i have|this is)/i.test(line)) || titleLines[0] || 'Update';
-      prTitle = prTitle.replace(/^["']|["']$/g, '').trim().slice(0, 72);
+      
+      const titleLines = prTitleRaw.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+      const preambleWithColon = /^(?:sure|here|proposed|below|this|i|my|the|an|title|summary|ok|okay|pr|as requested).*?[:]\s*/i;
+      const noiseOnly = /^(?:sure|here|below|ok|okay|hi|hello|yes|i have (?:applied|updated).*|thanks|thank you|as requested)[!.]?$/i;
+
+      let candidates = titleLines
+        .map(l => l.replace(preambleWithColon, '').replace(/^["']|["']$/g, '').trim())
+        .filter(l => l.length > 0 && !noiseOnly.test(l));
+
+      let prTitle = candidates[0] || 'Update';
+      if (prTitle.length < 4) {
+        const nextBest = candidates.find(l => l.length > 4);
+        if (nextBest) prTitle = nextBest;
+      }
+      if (!prTitle || prTitle.length < 4) prTitle = 'Update';
+      prTitle = prTitle.slice(0, 72);
+
       const resolvesList = issues.map(i => `Resolves #${i.number}`).join('\n');
       const prBodyFile = `/tmp/forest-pr-body-${Date.now()}.txt`;
       writeFileSync(prBodyFile, `${resolvesList}\n\n${issueList}`);
