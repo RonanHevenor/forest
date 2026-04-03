@@ -10,7 +10,7 @@
  * 2. Implement (Gemini Autonomous)
  * 3. Review (Gemini - Iterative)
  * 4. Fix & Commit (Gemini Autonomous - Iterative)
- * 5. PR & User Approval
+ * 5. PR & User Approval (GitHub Reviews/Comments)
  */
 
 const { spawnSync }                                   = require('child_process');
@@ -38,11 +38,10 @@ if (existsSync(envPath)) {
 const NTFY_TOPIC = process.env.NTFY_TOPIC || 'designer-slick-fetch-lily-spherical-gout-chitchat-snorkel';
 const NTFY_URL   = `https://ntfy.sh/${NTFY_TOPIC}`;
 const GITHUB_REPO = process.env.GITHUB_REPO || 'thepoly/polymer';
-const BOT_REPO    = process.env.BOT_REPO || '/home/poly/forest';
+const BOT_REPO    = process.env.BOT_REPO || '/home/poly/polymer-bot';
 const GEMINI_MODELS = (process.env.GEMINI_MODELS || 'gemini-3.1-pro-preview,gemini-2.5-pro,gemini-3-flash-preview').split(',');
 
 const LOCKFILE     = '/tmp/forest.lock';
-const APPROVAL_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24h
 const MAX_CYCLES   = 5;
 const ISSUE_IMAGE_ROOT = '/tmp/forest-issue-images';
 const MAX_ISSUE_IMAGES = 6;
@@ -311,7 +310,7 @@ function runAgent(label, bin, args, cwd, { input, captureOutput = true } = {}) {
   return out;
 }
 
-async function runGemini(label, args, cwd) {
+async function runGemini(label, args, cwd, options = {}) {
   const baseArgs = stripModelArg(args);
 
   for (const model of GEMINI_MODELS) {
@@ -330,7 +329,11 @@ async function runGemini(label, args, cwd) {
     }
   }
 
-  log(`All Gemini models exhausted. Will retry on next timer tick.`);
+  if (options.onAllExhausted) {
+    await options.onAllExhausted();
+  } else {
+    log(`All Gemini models exhausted. Will retry on next timer tick.`);
+  }
   process.exit(0); 
 }
 
@@ -353,60 +356,70 @@ async function ntfyPost(body, title, priority = 'default') {
   }
 }
 
-async function waitForApproval(since) {
-  const url = `${NTFY_URL}/json?since=${since}`;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), APPROVAL_TIMEOUT_MS);
-  let buffer = '';
-
-  log('Waiting for approval on ntfy...');
-
-  let reader;
+function getPRFeedback(prUrl) {
   try {
-    const response = await fetch(url, { signal: controller.signal });
-    reader = response.body.getReader();
-    const decoder = new TextDecoder();
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const event = JSON.parse(line);
-          if (event.event === 'keepalive') continue;
-          const msg = (event.message || '').trim().toLowerCase();
-          if (msg === 'merge' || msg === 'go') {
-            await reader.cancel().catch(() => {});
-            controller.abort();
-            return 'merge';
-          }
-          if (msg === 'iterate' || msg === 'no' || msg === 'cancel') {
-            await reader.cancel().catch(() => {});
-            controller.abort();
-            return 'iterate';
-          }
-          if (msg === 'stop') {
-            await reader.cancel().catch(() => {});
-            controller.abort();
-            return 'stop';
-          }
-        } catch {}
+    const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${GITHUB_REPO} --json reviews,comments`));
+    const feedback = [];
+    
+    // Top-level comments
+    for (const c of (data.comments || [])) {
+      if (c.author.login === 'RonanHevenor') {
+        feedback.push(`Comment from RonanHevenor: ${c.body}`);
       }
     }
-    await reader.cancel().catch(() => {});
-  } catch (err) {
-    if (reader) await reader.cancel().catch(() => {});
-    if (err.name === 'AbortError') return 'timeout';
-    throw err;
-  } finally {
-    clearTimeout(timeoutId);
+    
+    // Reviews
+    for (const r of (data.reviews || [])) {
+      if (r.author.login === 'RonanHevenor') {
+        if (r.body) feedback.push(`Review from RonanHevenor (${r.state}): ${r.body}`);
+        for (const lc of (r.comments || [])) {
+          feedback.push(`Code comment from RonanHevenor on ${lc.path}:${lc.line}: ${lc.body}`);
+        }
+      }
+    }
+    
+    return feedback.length > 0 ? feedback.join('\n\n---\n\n') : null;
+  } catch (e) {
+    log(`Warning: Failed to fetch PR feedback: ${e.message}`);
+    return null;
   }
-  return 'timeout';
+}
+
+async function waitForApproval(prUrl) {
+  log(`Waiting for RonanHevenor to review/approve PR: ${prUrl}`);
+  
+  while (true) {
+    try {
+      const data = JSON.parse(exec(`gh pr view ${prUrl} --repo ${GITHUB_REPO} --json reviews,comments,state`));
+      
+      const approval = (data.reviews || []).find(r => r.author.login === 'RonanHevenor' && r.state === 'APPROVED');
+      if (approval) return 'merge';
+      
+      const changesRequested = (data.reviews || []).find(r => r.author.login === 'RonanHevenor' && r.state === 'CHANGES_REQUESTED');
+      if (changesRequested) return 'iterate';
+      
+      const allComments = [
+        ...(data.comments || []),
+        ...(data.reviews || []).map(r => ({ body: r.body, author: r.author })),
+        ...(data.reviews || []).flatMap(r => r.comments || [])
+      ];
+      
+      for (const c of allComments) {
+        if (!c || !c.author || c.author.login !== 'RonanHevenor') continue;
+        const msg = (c.body || '').trim().toLowerCase();
+        if (msg.includes('/merge')) return 'merge';
+        if (msg.includes('/iterate')) return 'iterate';
+        if (msg.includes('/stop')) return 'stop';
+      }
+      
+      if (data.state === 'MERGED' || data.state === 'CLOSED') return 'stop';
+
+    } catch (e) {
+      log(`Error polling PR: ${e.message}`);
+    }
+    
+    await new Promise(r => setTimeout(r, 30000)); 
+  }
 }
 
 // ─── Core ─────────────────────────────────────────────────────────────────────
@@ -445,7 +458,6 @@ async function pipeline() {
     branch = resumePR.headRefName;
     log(`Resuming existing bot PR #${resumePR.number} (${branch}).`);
     
-    // Extract issues from body: "Resolves #123" or "Automated PR resolving: #123"
     const bodyText = resumePR.body || '';
     const issueMatches = bodyText.match(/#[0-9]+/g);
     if (issueMatches) {
@@ -473,6 +485,14 @@ async function pipeline() {
     log('No open issues. Exiting.');
     process.exit(0);
   }
+
+  const issueList = issues.map(i => `• #${i.number}: ${i.title}`).join('\n');
+  const issueRefs = issues.map(i => `#${i.number}`).join(', ');
+
+  if (!resumePR) {
+    await ntfyPost(`Starting work on ${issues.length} issue(s):\n\n${issueList}`, `forest — Working on ${issueRefs}`);
+  }
+
   log(`Processing ${issues.length} issue(s): ${issues.map(i => '#' + i.number).join(', ')}`);
 
   if (!existsSync(BOT_REPO)) {
@@ -519,23 +539,32 @@ async function pipeline() {
     'Be precise — match existing production patterns.',
   ].join('\n');
 
-  const issueRefs = enrichedIssues.map(i => `#${i.number}`).join(', ');
-  const issueList  = enrichedIssues.map(i => `• #${i.number}: ${i.title}`).join('\n');
   const visualContext = buildVisualContextBlock(enrichedIssues);
+
+  const exhaustedHandler = async () => {
+    const msg = `Found new issues but all Gemini models are exhausted.\n\nIssues:\n${issueList}\n\nWill retry on next timer tick.`;
+    await ntfyPost(msg, 'forest — Quota Exhausted', 'default');
+  };
 
   // ── 1: Plan 
   const planPrompt = `${codebaseCtx}\nAnalyze these issues and produce a thorough, step-by-step implementation plan.\n\n## Visual Context\n${visualContext}\n\n${issueText}`;
-  const plan = await runGemini('Gemini:plan', [...issueImageArgs, '-p', planPrompt, '-y', '--output-format', 'text'], BOT_REPO);
+  const plan = await runGemini('Gemini:plan', [...issueImageArgs, '-p', planPrompt, '-y', '--output-format', 'text'], BOT_REPO, { onAllExhausted: exhaustedHandler });
 
   // ── 2: Implement (Skip if resuming)
   if (!resumePR) {
     const implPrompt = `${codebaseCtx}\nImplement the plan. Edit necessary files. Edits only.\n\n## Issues\n${issueText}\n\n## Plan\n${plan}`;
-    await runGemini('Gemini:impl', [...issueImageArgs, '-p', implPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], BOT_REPO);
+    await runGemini('Gemini:impl', [...issueImageArgs, '-p', implPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], BOT_REPO, { onAllExhausted: exhaustedHandler });
   }
 
   let cycleCount = 0;
   while (cycleCount < MAX_CYCLES) {
     cycleCount += 1;
+
+    let prUrl;
+    try { prUrl = exec(`gh pr view ${branch} --repo ${GITHUB_REPO} --json url -q .url`, { allowFailure: true }); } catch {}
+
+    const userFeedback = prUrl ? getPRFeedback(prUrl) : null;
+    const feedbackCtx = userFeedback ? `\n\n## Human Review Feedback (HIGH PRIORITY)\n${userFeedback}` : '';
 
     // ── 3: Evaluate
     const fullDiff      = exec(`git -C ${BOT_REPO} diff origin/main`, { allowFailure: true });
@@ -543,20 +572,17 @@ async function pipeline() {
     const diffSection   = fullDiff  ? `\`\`\`diff\n${fullDiff}\n\`\`\`` : '(no changes)';
     const newFiles      = untracked ? `\n## New Files\n${untracked}` : '';
 
-    const evalPrompt = `${codebaseCtx}\nReview these changes. Identify bugs, regressions, or type errors.\n\n## Issues\n${issueText}\n\n## Plan\n${plan}\n\n## Changes\n${diffSection}${newFiles}`;
-    const evaluation = await runGemini(`Gemini:eval:c${cycleCount}`, [...issueImageArgs, '-p', evalPrompt, '-y', '--output-format', 'text'], BOT_REPO);
+    const evalPrompt = `${codebaseCtx}\nReview these changes. Identify bugs, regressions, or type errors.${feedbackCtx}\n\n## Issues\n${issueText}\n\n## Plan\n${plan}\n\n## Changes\n${diffSection}${newFiles}`;
+    const evaluation = await runGemini(`Gemini:eval:c${cycleCount}`, [...issueImageArgs, '-p', evalPrompt, '-y', '--output-format', 'text'], BOT_REPO, { onAllExhausted: exhaustedHandler });
 
     // ── 4: Fix
-    const fixPrompt = `${codebaseCtx}\nFix issues Gemini identified.\n\n## Review\n${evaluation}\n\n## Changes\n${diffSection}\n\nInstructions:\n- If you modified package.json or collections, run \`pnpm install\` and \`pnpm generate:types\`.\n- BEFORE COMMITTING: run \`pnpm lint\` and \`pnpm typecheck\`.\n- Commit referencing ${issueRefs}. No push.`;
-    await runGemini(`Gemini:fix:c${cycleCount}`, [...issueImageArgs, '-p', fixPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], BOT_REPO);
+    const fixPrompt = `${codebaseCtx}\nFix issues Gemini identified and address human feedback.${feedbackCtx}\n\n## Gemini Review\n${evaluation}\n\n## Changes\n${diffSection}\n\nInstructions:\n- If you modified package.json or collections, run \`pnpm install\` and \`pnpm generate:types\`.\n- BEFORE COMMITTING: run \`pnpm lint\` and \`pnpm typecheck\`.\n- Commit referencing ${issueRefs}. No push.`;
+    await runGemini(`Gemini:fix:c${cycleCount}`, [...issueImageArgs, '-p', fixPrompt, '--approval-mode', 'yolo', '--output-format', 'text'], BOT_REPO, { onAllExhausted: exhaustedHandler });
 
     const commits = exec(`git -C ${BOT_REPO} log origin/main..HEAD --format="• %s"`, { allowFailure: true });
     if (!commits) break;
 
     exec(`git -C ${BOT_REPO} push -f -u origin ${branch}`);
-
-    let prUrl;
-    try { prUrl = exec(`gh pr view ${branch} --repo ${GITHUB_REPO} --json url -q .url`, { allowFailure: true }); } catch {}
 
     if (!prUrl) {
       const titlePrompt = `Write a PR title for these changes.\n\nIssues:\n${issueRefs}\n\nCommits:\n${commits}`;
@@ -573,19 +599,24 @@ async function pipeline() {
       }
     }
 
-    const proposal = [`${enrichedIssues.length} issue(s) resolved. Cycle ${cycleCount} complete.`, `PR: ${prUrl}`, '', 'Reply:', '• "merge" to deploy', '• "iterate" to review again', '• "stop" to shutdown timer'].join('\n');
-    const since = Math.floor(Date.now() / 1000);
+    const proposal = [
+      `${enrichedIssues.length} issue(s) resolved. Cycle ${cycleCount} complete.`,
+      `PR: ${prUrl}`,
+      '',
+      'Please review on GitHub:',
+      '• APPROVE to merge and deploy',
+      '• REQUEST CHANGES to trigger a fix cycle',
+      '• Comment "/stop" to shutdown timer',
+    ].join('\n');
+
     await ntfyPost(proposal, `forest — Approval (C${cycleCount})`, 'high');
 
-    const decision = await waitForApproval(since);
+    const decision = await waitForApproval(prUrl);
     if (decision === 'merge') {
       exec(`gh pr merge ${prUrl} --squash --delete-branch --admin --repo ${GITHUB_REPO}`);
-      
-      // Explicitly close issues as fallback
       for (const issue of enrichedIssues) {
         exec(`gh issue close ${issue.number} --repo ${GITHUB_REPO} --comment "Resolved by ${prUrl}"`, { allowFailure: true });
       }
-      
       await ntfyPost(`Merged!`, 'forest — Deployed', 'high');
       break;
     } else if (decision === 'iterate') {
