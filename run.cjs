@@ -641,9 +641,23 @@ async function pipeline(repo) {
     exec(`git -C ${workspace} push -f -u origin ${branch}`);
 
     if (!prUrl) {
-      const titlePrompt = `Write a PR title summarizing these changes: ${issueRefs}`;
-      const prTitleRaw = await runGemini(`${repo}:title`, ['-p', titlePrompt, '-y', '--output-format', 'text'], workspace);
-      const prTitle = prTitleRaw.split('\n')[0].trim().slice(0, 72);
+      const finalDiff = exec(`git -C ${workspace} diff origin/main`, { allowFailure: true });
+      const titlePrompt = `You are a PR title generator. Write a concise, descriptive PR title (max 72 chars) based ONLY on the following information.
+Do NOT use any tools. Do NOT search the codebase.
+Return ONLY the title text. No preamble. No extra text. No quotes.
+
+Commits:
+${commits}
+
+Diff Summary:
+${finalDiff.slice(0, 5000)}
+
+Issues: ${issueRefs}`;
+
+      const prTitleRaw = await runGemini(`${repo}:title`, ['-p', titlePrompt, '-y', '--output-format', 'text', '-e', 'none'], workspace);
+      let prTitle = prTitleRaw.split('\n').map(l => l.trim()).find(l => l.length > 0 && !l.toLowerCase().includes('i will')) || `Fixes ${issueRefs}`;
+      prTitle = prTitle.replace(/^"|"$/g, '').slice(0, 72);
+
       const resolvesList = issues.map(i => `Resolves #${i.number}`).join('\n');
       const prBodyFile = `/tmp/forest-pr-body-${Date.now()}.txt`;
       writeFileSync(prBodyFile, `${resolvesList}\n\n${issueList}`);
