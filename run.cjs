@@ -641,9 +641,27 @@ async function pipeline(repo) {
     exec(`git -C ${workspace} push -f -u origin ${branch}`);
 
     if (!prUrl) {
-      const titlePrompt = `Write a PR title summarizing these changes: ${issueRefs}`;
-      const prTitleRaw = await runGemini(`${repo}:title`, ['-p', titlePrompt, '-y', '--output-format', 'text'], workspace);
-      const prTitle = prTitleRaw.split('\n')[0].trim().slice(0, 72);
+      const finalDiff = exec(`git -C ${workspace} diff origin/main`, { allowFailure: true });
+      const titlePrompt = `You are a PR title generator. Write a concise, descriptive PR title (max 72 chars) based ONLY on the following information.
+Do NOT use any tools. Do NOT search the codebase.
+Return ONLY the title text. No preamble. No extra text. No quotes.
+IMPORTANT: Your response MUST be EXACTLY one line of text. DO NOT EXPLAIN. DO NOT SAY "I WILL".
+
+Commits:
+${commits}
+
+Diff Summary:
+${finalDiff.slice(0, 5000)}
+
+Issues: ${issueRefs}`;
+
+      const prTitleRaw = await runGemini(`${repo}:title`, ['-p', titlePrompt, '-y', '--output-format', 'text', '-e', 'none'], workspace);
+      const agentSpeakRegex = /^(i will|i'll|i am|let's|let me|i've|i have|ok|sure|i'm|here is|here's|the pr title|this pr|based on|to summarize|here are|here's a|here is a)/i;
+      let prTitle = prTitleRaw.split('\n')
+        .map(l => l.replace(/\*\*/g, '').trim().replace(/^["'`]+|["'`]+$/g, ''))
+        .find(l => l.length > 0 && !agentSpeakRegex.test(l)) || `Fixes ${issueRefs}`;
+      prTitle = prTitle.replace(/^(pr title|title|summary|here is the pr title|here is the title|this is the title|here is a concise pr title|proposed title):\s*/i, '').trim().slice(0, 72);
+
       const resolvesList = issues.map(i => `Resolves #${i.number}`).join('\n');
       const prBodyFile = `/tmp/forest-pr-body-${Date.now()}.txt`;
       writeFileSync(prBodyFile, `${resolvesList}\n\n${issueList}`);
